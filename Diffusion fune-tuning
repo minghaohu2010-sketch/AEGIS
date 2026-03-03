@@ -14,30 +14,7 @@ import torch.nn.functional as F
 from diffusers import StableDiffusionPipeline
 from diffusers.optimization import get_scheduler
 from peft import LoraConfig, get_peft_model
-
-
-class AdaptiveFeatureFusion(nn.Module):
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        self.local_attention = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=1),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-        )
-        self.global_attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // reduction, kernel_size=1),
-            nn.BatchNorm2d(channels // reduction),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, kernel_size=1),
-            nn.BatchNorm2d(channels),
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x1, x2):
-        x = x1 + x2
-        attention = self.sigmoid(self.local_attention(x) + self.global_attention(x))
-        return x1 * attention + x2 * (1 - attention)
+from aff_adapter_def import AdaptiveFeatureFusion
 
 
 class UNetAFFAdapter(nn.Module):
