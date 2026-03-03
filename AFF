@@ -1,0 +1,113 @@
+import torch.nn as nn
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionOutput
+
+
+class AdaptiveFeatureFusion(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.local_attention = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.global_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, kernel_size=1),
+            nn.BatchNorm2d(channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, kernel_size=1),
+            nn.BatchNorm2d(channels),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x1, x2):
+        x = x1 + x2
+        attention = self.sigmoid(self.local_attention(x) + self.global_attention(x))
+        return x1 * attention + x2 * (1 - attention)
+
+
+class SimpleUNetAFFAdapter(nn.Module):
+    def __init__(self, unet, channels_dict=None):
+        super().__init__()
+        self._unet = unet
+
+        if channels_dict is None:
+            channels_dict = {
+                "down_0": 320,
+                "down_1": 640,
+                "down_2": 1280,
+                "mid":    1280,
+                "up_0":   1280,
+                "up_1":   640,
+            }
+
+        self.aff_modules = nn.ModuleDict({
+            "mid_down_2":  AdaptiveFeatureFusion(channels_dict["mid"]),
+            "up_0_down_1": AdaptiveFeatureFusion(channels_dict["up_0"]),
+            "up_1_down_0": AdaptiveFeatureFusion(channels_dict["up_1"]),
+        })
+
+        self.skip_features = {}
+        self._register_hooks()
+
+    def _get_base_unet(self):
+        unet = self._unet
+        if hasattr(unet, "base_model") and hasattr(unet.base_model, "model"):
+            return unet.base_model.model
+        return unet
+
+    def apply_aff(self, x, step):
+        if step == "mid_down_2" and "down_2" in self.skip_features:
+            return self.aff_modules["mid_down_2"](x, self.skip_features["down_2"])
+        elif step == "up_0_down_1" and "down_1" in self.skip_features:
+            return self.aff_modules["up_0_down_1"](x, self.skip_features["down_1"])
+        elif step == "up_1_down_0" and "down_0" in self.skip_features:
+            return self.aff_modules["up_1_down_0"](x, self.skip_features["down_0"])
+        return x
+
+    def _register_hooks(self):
+        base_unet = self._get_base_unet()
+
+        def get_down_hook(idx):
+            def hook(module, input, output):
+                feat = output[0] if isinstance(output, tuple) else output
+                self.skip_features[f"down_{idx}"] = feat
+            return hook
+
+        def mid_hook(module, input, output):
+            feat = output[0] if isinstance(output, tuple) else output
+            self.skip_features["mid"] = feat
+            fused = self.apply_aff(feat, "mid_down_2")
+            return (fused,) + output[1:] if isinstance(output, tuple) else fused
+
+        def get_up_hook(step_name):
+            def hook(module, input, output):
+                feat = output[0] if isinstance(output, tuple) else output
+                fused = self.apply_aff(feat, step_name)
+                return (fused,) + output[1:] if isinstance(output, tuple) else fused
+            return hook
+
+        if hasattr(base_unet, "down_blocks"):
+            for i, block in enumerate(base_unet.down_blocks):
+                block.register_forward_hook(get_down_hook(i))
+
+        if hasattr(base_unet, "mid_block"):
+            base_unet.mid_block.register_forward_hook(mid_hook)
+
+        if hasattr(base_unet, "up_blocks"):
+            for i, step_name in {0: "up_0_down_1", 1: "up_1_down_0"}.items():
+                if i < len(base_unet.up_blocks):
+                    base_unet.up_blocks[i].register_forward_hook(get_up_hook(step_name))
+
+    def forward(self, sample, timestep, encoder_hidden_states, return_dict=True, **kwargs):
+        self.skip_features = {}
+        output = self._unet(
+            sample=sample,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            return_dict=True,
+            **kwargs,
+        )
+        if return_dict:
+            return output
+        return (output.sample,)
