@@ -1,0 +1,266 @@
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
+
+DATA_DIR      = r"neoadjuvant_data"
+N_FOLDS       = 5
+N_EPOCHS      = 80
+FEATURE_DIM   = 512
+BATCH_SIZE    = 32
+MAX_INSTANCES = 400
+RANDOM_SEED   = 42
+AUGMENT_RATIO = 5
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+class CBAM(nn.Module):
+    def __init__(self, n_features, dropout_rate=0.3):
+        super().__init__()
+        self.channel_attention = nn.Sequential(
+            nn.Linear(n_features, max(2, n_features // 2)),
+            nn.BatchNorm1d(max(2, n_features // 2), track_running_stats=False),
+            nn.ReLU(), nn.Dropout(dropout_rate),
+            nn.Linear(max(2, n_features // 2), n_features),
+            nn.Sigmoid()
+        )
+        self.spatial_attention = nn.Sequential(
+            nn.Conv1d(n_features, 1, kernel_size=min(7, n_features),
+                      padding=min(3, n_features // 2)),
+            nn.BatchNorm1d(1, track_running_stats=False),
+            nn.Sigmoid()
+        )
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x):
+        B, N, C = x.size()
+        avg = x.mean(1).reshape(B, C)
+        mx  = x.max(1)[0].reshape(B, C)
+        ca  = self.channel_attention(avg + mx).unsqueeze(1)
+        x   = (x * ca).transpose(1, 2)
+        sa  = self.spatial_attention(x)
+        return self.dropout((x * sa).transpose(1, 2))
+
+class MARB(nn.Module):
+    def __init__(self, n_features, dropout_rate=0.5):
+        super().__init__()
+        ks  = [min(k, n_features) for k in [3, 5, 7, 9, 11]]
+        oc  = min(128, max(16, n_features))
+        self.convs   = nn.ModuleList([
+            nn.Conv1d(n_features, oc, k, padding=k // 2) for k in ks])
+        self.bns     = nn.ModuleList([
+            nn.BatchNorm1d(oc, track_running_stats=False) for _ in ks])
+        self.relu    = nn.ReLU()
+        self.drop    = nn.Dropout(dropout_rate)
+        self.concat_features = oc * 5
+        self.bn_cat  = nn.BatchNorm1d(self.concat_features, track_running_stats=False)
+        self.cbam    = CBAM(self.concat_features, dropout_rate)
+        self.residual = nn.Sequential(
+            nn.Linear(n_features, self.concat_features),
+            nn.BatchNorm1d(self.concat_features, track_running_stats=False),
+            nn.ReLU(), nn.Dropout(dropout_rate)
+        )
+
+    def forward(self, x):
+        B, N, C = x.size()
+        xt   = x.transpose(1, 2)
+        outs = [self.drop(self.relu(bn(conv(xt))))
+                for conv, bn in zip(self.convs, self.bns)]
+        cat  = self.bn_cat(torch.cat(outs, dim=1)).transpose(1, 2)
+        enh  = self.cbam(cat)
+        res  = self.residual(x.reshape(B * N, C)).view(B, N, -1)
+        return enh + res if enh.shape == res.shape else enh
+
+class FeatureExtractorModel(nn.Module):
+    def __init__(self, n_features, feature_dim=512):
+        super().__init__()
+        self.marb1 = MARB(n_features, dropout_rate=0.6)
+        self.marb2 = MARB(self.marb1.concat_features, dropout_rate=0.6)
+        F2 = self.marb2.concat_features
+        self.attn = nn.Sequential(
+            nn.Linear(F2, 256),
+            nn.BatchNorm1d(256, track_running_stats=False), nn.Tanh(), nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128, track_running_stats=False), nn.Tanh(), nn.Dropout(0.3),
+            nn.Linear(128, 1)
+        )
+        self.proj = nn.Sequential(
+            nn.Linear(F2, feature_dim),
+            nn.BatchNorm1d(feature_dim, track_running_stats=False),
+            nn.ReLU(), nn.Dropout(0.3)
+        )
+        self.final_features = F2
+
+    def forward(self, x):
+        B, N, _ = x.size()
+        x = self.marb2(self.marb1(x))
+        a = self.attn(x.contiguous().view(B * N, -1)).view(B, N, 1)
+        w = F.softmax(a, dim=1)
+        return self.proj(torch.sum(w * x, dim=1))
+
+def load_data():
+    df1 = pd.read_csv(os.path.join(DATA_DIR, 'CT_Feature_extraction_modified.csv'),
+                      dtype={'patient_id': str})
+    df1['dataset_source'] = 'dataset1'
+
+    df2 = pd.read_csv(os.path.join(DATA_DIR, 'Combined_Feature_extraction.csv'),
+                      dtype={'patient_id': str})
+    df2['dataset_source'] = 'dataset2'
+
+    all_df = pd.concat([df1, df2], ignore_index=True)
+
+    outcome = pd.read_excel(os.path.join(DATA_DIR, 'neoadjuvant outcome.xlsx'),
+                            dtype={'ID': str})
+    outcome = outcome.rename(columns={'ID': 'patient_id'})
+    outcome['binary_response'] = outcome['response'].apply(
+        lambda x: 1 if str(x).lower() in ['cpr', 'mpr'] else 0)
+    response_df = outcome[['patient_id', 'binary_response']].drop_duplicates('patient_id')
+
+    NON_FEAT  = {'slice_index', 'patient_id', 'hospital_number',
+                 'matched_id', 'source_dir', 'response', 'dataset_source', 'binary_response'}
+    feat_cols = [c for c in all_df.columns if c not in NON_FEAT]
+    resp_map  = response_df.set_index('patient_id')['binary_response'].to_dict()
+
+    bags, labels, pid_list, sources = [], [], [], []
+    for pid, grp in all_df.groupby('patient_id'):
+        bags.append(grp[feat_cols].values.astype(np.float32))
+        labels.append(resp_map[pid])
+        pid_list.append(pid)
+        sources.append(grp['dataset_source'].iloc[0])
+
+    return bags, np.array(labels), pid_list, np.array(sources)
+
+def pad_bags(bags):
+    C   = bags[0].shape[1]
+    out = []
+    for bag in bags:
+        N = len(bag)
+        if N < MAX_INSTANCES:
+            out.append(np.vstack([bag, np.zeros((MAX_INSTANCES - N, C))]))
+        elif N > MAX_INSTANCES:
+            s = (N - MAX_INSTANCES) // 2
+            out.append(bag[s:s + MAX_INSTANCES])
+        else:
+            out.append(bag)
+    return np.array(out, dtype=np.float32)
+
+def train_extractor(data_tensor, n_features):
+    model  = FeatureExtractorModel(n_features, FEATURE_DIM).to(device)
+    target = nn.Linear(n_features, FEATURE_DIM).to(device)
+    opt    = optim.Adam(list(model.parameters()) + list(target.parameters()),
+                        lr=1e-3, weight_decay=1e-5)
+    sched  = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=N_EPOCHS)
+    crit   = nn.MSELoss()
+    loader = DataLoader(TensorDataset(data_tensor),
+                        batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+    for epoch in range(N_EPOCHS):
+        model.train(); target.train()
+        for (batch,) in loader:
+            batch = batch.to(device)
+            opt.zero_grad()
+            feat = model(batch)
+            with torch.no_grad():
+                tgt = target(batch.mean(dim=1))
+            crit(feat, tgt).backward()
+            opt.step()
+        sched.step()
+    return model
+
+def extract_features(model, data_array):
+    model.eval()
+    t     = torch.tensor(data_array, dtype=torch.float32)
+    feats = []
+    with torch.no_grad():
+        for i in range(0, len(t), BATCH_SIZE):
+            batch = t[i:i + BATCH_SIZE].to(device)
+            feats.append(model(batch).cpu().numpy())
+    return np.vstack(feats)
+
+def compute_metrics(y_true, y_pred, y_prob):
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    return {
+        'AUC'        : round(roc_auc_score(y_true, y_prob), 4),
+        'Accuracy'   : round(accuracy_score(y_true, y_pred), 4),
+        'Sensitivity': round(tp / (tp + fn), 4),
+        'Specificity': round(tn / (tn + fp), 4),
+        'TP': int(tp), 'TN': int(tn), 'FP': int(fp), 'FN': int(fn),
+    }
+
+bags, labels, _, sources = load_data()
+n_features  = bags[0].shape[1]
+all_data    = pad_bags(bags)
+all_labels  = labels
+all_sources = sources
+
+np.random.seed(RANDOM_SEED)
+d1_mask = all_sources == 'dataset1'
+d2_mask = all_sources == 'dataset2'
+n_d1    = int(d1_mask.sum())
+
+if AUGMENT_RATIO == 0 or not d2_mask.any():
+    keep_mask = d1_mask
+
+elif AUGMENT_RATIO == -1:
+    keep_mask = np.ones(len(all_sources), dtype=bool)
+
+else:
+    target_n   = n_d1 * AUGMENT_RATIO
+    d2_idx     = np.where(d2_mask)[0]
+    d2_labels  = all_labels[d2_mask]
+    pos_idx    = d2_idx[d2_labels == 1]
+    neg_idx    = d2_idx[d2_labels == 0]
+    n_each     = target_n // 2
+    sampled    = np.concatenate([
+        np.random.choice(pos_idx, n_each, replace=(len(pos_idx) < n_each)),
+        np.random.choice(neg_idx, n_each, replace=(len(neg_idx) < n_each))
+    ])
+    keep_mask          = d1_mask.copy()
+    keep_mask[sampled] = True
+
+all_data    = all_data[keep_mask]
+all_labels  = all_labels[keep_mask]
+all_sources = all_sources[keep_mask]
+
+strat_labels = np.array([f"{s}_{l}" for s, l in zip(all_sources, all_labels)])
+skf          = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+
+for fold, (train_idx, val_idx) in enumerate(skf.split(all_data, strat_labels)):
+    X_tr, X_val = all_data[train_idx],   all_data[val_idx]
+    y_tr, y_val = all_labels[train_idx], all_labels[val_idx]
+    s_val       = all_sources[val_idx]
+
+    extractor = train_extractor(torch.tensor(X_tr, dtype=torch.float32), n_features)
+
+    feat_tr  = extract_features(extractor, X_tr)
+    feat_val = extract_features(extractor, X_val)
+
+    pos_n = np.sum(y_tr == 1)
+    neg_n = np.sum(y_tr == 0)
+    cw    = {0: 1.0, 1: neg_n / pos_n}
+    rf    = RandomForestClassifier(
+        n_estimators=800, max_depth=20, min_samples_split=10,
+        min_samples_leaf=4, max_features='sqrt', bootstrap=True,
+        class_weight=cw, random_state=RANDOM_SEED, n_jobs=-1
+    )
+    rf.fit(feat_tr, y_tr)
+
+    tr_prob  = rf.predict_proba(feat_tr)[:, 1]
+    tr_pred  = rf.predict(feat_tr)
+    val_prob = rf.predict_proba(feat_val)[:, 1]
+    val_pred = rf.predict(feat_val)
+
+    m_real = s_val == 'dataset1'
+    m_syn  = s_val == 'dataset2'
+
+    metrics_train = compute_metrics(y_tr, tr_pred, tr_prob)
+    metrics_real  = compute_metrics(y_val[m_real], val_pred[m_real], val_prob[m_real])
+    metrics_syn   = compute_metrics(y_val[m_syn],  val_pred[m_syn],  val_prob[m_syn])
+    metrics_comb  = compute_metrics(y_val, val_pred, val_prob)
