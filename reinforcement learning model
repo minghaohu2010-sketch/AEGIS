@@ -1,0 +1,77 @@
+import os
+import torch
+import pandas as pd
+
+from diffusers import StableDiffusionPipeline, DDIMScheduler
+from peft import PeftModel
+
+from reinforcement_learning_trainer import (
+    SimpleRLTrainer,
+    RewardModelAdapter,
+    load_prompt_dataset,
+)
+from reward_model_def import EfficientNetV2RewardModel
+
+
+base_model_path   = "./Prompt2MedImage_local"
+lora_model_dir    = "lora_ct_model/best_model"
+reward_model_path = "reward_model_v2m/reward_model_v2m.pth"
+prompt_file       = "your_prompts.xlsx"
+output_dir        = "rl_results_v3"
+
+learning_rate               = 1e-6
+batch_size                  = 4
+gradient_accumulation_steps = 4
+num_inference_steps         = 50
+guidance_scale              = 7.5
+num_epochs                  = 100
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+if torch.cuda.is_available():
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+else:
+    dtype = torch.float32
+
+os.makedirs(output_dir, exist_ok=True)
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    base_model_path,
+    torch_dtype=dtype,
+    safety_checker=None,
+    requires_safety_checker=False,
+)
+pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+pipe.to(device)
+
+pipe.unet = PeftModel.from_pretrained(pipe.unet, lora_model_dir, torch_dtype=dtype)
+pipe.to(device)
+
+reward_model_backend = EfficientNetV2RewardModel()
+state_dict = torch.load(reward_model_path, map_location="cpu", weights_only=True)
+
+if all(k.startswith("module.") for k in state_dict.keys()):
+    state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+reward_model_backend.load_state_dict(state_dict, strict=False)
+reward_model_backend.eval()
+reward_model_backend.to(device)
+reward_model_instance = RewardModelAdapter(reward_model_backend, device)
+
+prompt_dataset = load_prompt_dataset(prompt_file)
+
+trainer = SimpleRLTrainer(
+    diffusion_pipeline=pipe,
+    reward_model=reward_model_instance,
+    prompt_dataset=prompt_dataset,
+    device=device,
+    output_dir=output_dir,
+    learning_rate=learning_rate,
+    batch_size=batch_size,
+    gradient_accumulation_steps=gradient_accumulation_steps,
+    num_inference_steps=num_inference_steps,
+    guidance_scale=guidance_scale,
+    num_epochs=num_epochs,
+    gradient_checkpointing=False,
+)
+
+trainer.train()
